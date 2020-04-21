@@ -1690,7 +1690,9 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 		mediaSections = append(mediaSections, mediaSection{id: "data", data: true})
 	} else {
 		for _, t := range pc.GetTransceivers() {
-			mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), transceivers: []*RTPTransceiver{t}})
+			midValue := strconv.Itoa(len(mediaSections))
+			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: []*RTPTransceiver{t}})
+			t.setMid(midValue)
 		}
 
 		mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), data: true})
@@ -1739,7 +1741,12 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 			continue
 		}
 
-		t, localTransceivers = satisfyTypeAndDirection(kind, direction, localTransceivers)
+		t, localTransceivers = satisfyMid(midValue, localTransceivers)
+		if t == nil {
+			t, localTransceivers = satisfyTypeAndDirection(kind, direction, localTransceivers)
+		}
+		t.setMid(midValue)
+
 		mediaTransceivers := []*RTPTransceiver{t}
 		switch pc.configuration.SDPSemantics {
 		case SDPSemanticsUnifiedPlanWithFallback:
@@ -1775,7 +1782,9 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	// If we are offering also include unmatched local transceivers
 	if !detectedPlanB && includeUnmatched {
 		for _, t := range localTransceivers {
-			mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), transceivers: []*RTPTransceiver{t}})
+			midValue := strconv.Itoa(len(mediaSections))
+			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: []*RTPTransceiver{t}})
+			t.setMid(midValue)
 		}
 	}
 

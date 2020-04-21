@@ -13,8 +13,22 @@ type RTPTransceiver struct {
 	receiver  atomic.Value // *RTPReceiver
 	direction atomic.Value // RTPTransceiverDirection
 
+	mid atomic.Value // related sdp media id
+
 	stopped bool
 	kind    RTPCodecType
+}
+
+func (t *RTPTransceiver) getMid() string {
+	if v := t.mid.Load(); v != nil {
+		return v.(string)
+	}
+
+	return ""
+}
+
+func (t *RTPTransceiver) setMid(mid string) {
+	t.mid.Store(mid)
 }
 
 // Sender returns the RTPTransceiver's RTPSender if it has one
@@ -88,6 +102,18 @@ func (t *RTPTransceiver) setSendingTrack(track *Track) error {
 		return fmt.Errorf("invalid state change in RTPTransceiver.setSending")
 	}
 	return nil
+}
+
+// Given a mid pluck a transceiver from the passed list
+// if no entry satisfies the requested type+direction returns a nil transceiver
+func satisfyMid(mid string, localTransceivers []*RTPTransceiver) (*RTPTransceiver, []*RTPTransceiver) {
+	for i := range localTransceivers {
+		t := localTransceivers[i]
+		if t.getMid() == mid {
+			return t, append(localTransceivers[:i], localTransceivers[i+1:]...)
+		}
+	}
+	return nil, localTransceivers
 }
 
 // Given a direction+type pluck a transceiver from the passed list

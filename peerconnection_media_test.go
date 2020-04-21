@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,24 @@ func offerMediaHasDirection(offer SessionDescription, kind RTPCodecType, directi
 		if media.MediaName.Media == kind.String() {
 			_, exists := media.Attribute(direction.String())
 			return exists
+		}
+	}
+	return false
+}
+
+func sdpMidHasSsrc(offer SessionDescription, mid string, ssrc uint32) bool {
+	for _, media := range offer.parsed.MediaDescriptions {
+		cmid, exists := media.Attribute("mid")
+		if !exists {
+			continue
+		}
+		if cmid != mid {
+			continue
+		}
+		cssrc, exists := media.Attribute("ssrc")
+		parts := strings.Split(cssrc, " ")
+		if parts[0] == strconv.Itoa(int(ssrc)) {
+			return true
 		}
 	}
 	return false
@@ -1000,6 +1019,116 @@ func TestPlanBMultiTrack(t *testing.T) {
 			}
 		}
 	}()
+
+	assert.NoError(t, pcOffer.Close())
+	assert.NoError(t, pcAnswer.Close())
+}
+
+// TestTransceiverKeerMID tests that we'll provide the same
+// transceiver for a media id on successive offer/answer
+func TestTransceiverKeepMid(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	pcOffer, err := NewPeerConnection(Configuration{})
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	pcAnswer, err := NewPeerConnection(Configuration{})
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	track1, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender1, err := pcOffer.AddTrack(track1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	track2, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pcOffer.AddTrack(track2); err != nil {
+		t.Fatal(err)
+	}
+
+	// this will create the initial offer using generateUnmatchedSDP
+	offer, err := pcOffer.CreateOffer(nil)
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	assert.NoError(t, pcOffer.SetLocalDescription(offer))
+	assert.NoError(t, pcAnswer.SetRemoteDescription(offer))
+
+	answer, err := pcAnswer.CreateAnswer(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, pcAnswer.SetLocalDescription(answer))
+	// apply answer so we'll test generateMatchedSDP
+	assert.NoError(t, pcOffer.SetRemoteDescription(answer))
+
+	// Must have 3 media descriptions (2 video and 1 datachannel)
+	assert.Equal(t, len(offer.parsed.MediaDescriptions), 3)
+
+	if !sdpMidHasSsrc(offer, "0", track1.SSRC()) {
+		t.Errorf("Expected mid %q with ssrc %d", "0", track1.SSRC())
+	}
+	if !sdpMidHasSsrc(offer, "1", track2.SSRC()) {
+		t.Errorf("Expected mid %q with ssrc %d", "1", track2.SSRC())
+	}
+
+	// Remove first track, must keep same number of media
+	// descriptions and same track ssrc for mid 1 as previous
+	err = pcOffer.RemoveTrack(sender1)
+	assert.NoError(t, err)
+
+	offer, err = pcOffer.CreateOffer(nil)
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	assert.Equal(t, len(offer.parsed.MediaDescriptions), 3)
+
+	if !sdpMidHasSsrc(offer, "1", track2.SSRC()) {
+		t.Errorf("Expected mid %q with ssrc %d", "1", track2.SSRC())
+	}
+
+	answer, err = pcAnswer.CreateAnswer(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, pcAnswer.SetLocalDescription(answer))
+	// apply answer so we'll test generateMatchedSDP
+	assert.NoError(t, pcOffer.SetRemoteDescription(answer))
+
+	// Add anothe track, must have one more media descriptions and same track ssrc for mid 1 as previous
+	track3, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pcOffer.AddTrack(track3); err != nil {
+		t.Fatal(err)
+	}
+
+	offer, err = pcOffer.CreateOffer(nil)
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	assert.Equal(t, len(offer.parsed.MediaDescriptions), 4)
+
+	if !sdpMidHasSsrc(offer, "1", track2.SSRC()) {
+		t.Errorf("Expected mid %q with ssrc %d", "1", track2.SSRC())
+	}
+	if !sdpMidHasSsrc(offer, "3", track3.SSRC()) {
+		t.Errorf("Expected mid %q with ssrc %d", "3", track3.SSRC())
+	}
 
 	assert.NoError(t, pcOffer.Close())
 	assert.NoError(t, pcAnswer.Close())

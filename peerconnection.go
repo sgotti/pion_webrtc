@@ -59,6 +59,10 @@ type PeerConnection struct {
 	// should be defined (see JSEP 3.4.1).
 	greaterMid int
 
+	// extmaps
+	remoteExtMaps map[int]*sdp.ExtMap
+	extMaps       map[int]*sdp.ExtMap
+
 	rtpTransceivers []*RTPTransceiver
 
 	onSignalingStateChangeHandler     func(SignalingState)
@@ -108,12 +112,36 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 		lastOffer:                    "",
 		lastAnswer:                   "",
 		greaterMid:                   -1,
+		remoteExtMaps:                make(map[int]*sdp.ExtMap),
 		signalingState:               SignalingStateStable,
 		iceConnectionState:           ICEConnectionStateNew,
 		connectionState:              PeerConnectionStateNew,
 
 		api: api,
 		log: api.settingEngine.LoggerFactory.NewLogger("pc"),
+	}
+
+	// populate with locally supported extmaps
+	pc.extMaps = map[int]*sdp.ExtMap{
+		// use the default value for transportcc
+		sdp.ExtMapValueTransportCC: {
+			Value: sdp.ExtMapValueTransportCC,
+			URI:   transportCCURI,
+			// support both send and recv direction
+			Direction: 0,
+		},
+		ExtMapValueSDESMid: {
+			Value: ExtMapValueSDESMid,
+			URI:   sdesMidURI,
+			// support both send and recv direction
+			Direction: 0,
+		},
+		ExtMapValueSDESRTPStreamID: {
+			Value: ExtMapValueSDESRTPStreamID,
+			URI:   sdesRTPStreamIDURI,
+			// support both send and recv direction
+			Direction: 0,
+		},
 	}
 
 	var err error
@@ -791,6 +819,10 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	var t *RTPTransceiver
 	localTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
 	detectedPlanB := descriptionIsPlanB(pc.RemoteDescription())
+
+	if err := pc.updateExtMaps(weOffer); err != nil {
+		return err
+	}
 
 	if !weOffer && !detectedPlanB {
 		for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
@@ -1969,4 +2001,58 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	}
 
 	return populateSDP(d, detectedPlanB, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState())
+}
+
+func (pc *PeerConnection) updateExtMaps(weOffer bool) error {
+	remoteExtMaps := map[int]*sdp.ExtMap{}
+
+	// populate the extmaps from the current remote description
+	for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
+		// populate known remote extmap and handle conflicts.
+		for _, attr := range media.Attributes {
+			if attr.Key != "extmap" {
+				continue
+			}
+			em := &sdp.ExtMap{}
+			if err := em.Unmarshal("extmap:" + attr.Value); err != nil {
+				pc.log.Warnf("Failed to parse ExtMap: %v", err)
+				continue
+			}
+			if remoteExtMap, ok := remoteExtMaps[em.Value]; ok {
+				if remoteExtMap.Value != em.Value {
+					return fmt.Errorf("RemoteDescription changed some extmaps values")
+				}
+			} else {
+				remoteExtMaps[em.Value] = em
+			}
+		}
+	}
+
+	// update our know remote extmaps from new extmaps from the current remote description
+	for _, curRemoteExtMap := range remoteExtMaps {
+		if remoteExtMap, ok := pc.remoteExtMaps[curRemoteExtMap.Value]; ok {
+			// check that the remote extmaps haven't changed some already known values
+			if remoteExtMap.Value != curRemoteExtMap.Value {
+				return fmt.Errorf("RemoteDescription changed some extmaps values")
+			}
+		} else {
+			// add new extmap
+			pc.remoteExtMaps[curRemoteExtMap.Value] = curRemoteExtMap
+		}
+	}
+
+	// If we are receving an offer update our extMaps adapting to the remote values
+	if !weOffer {
+		for _, remoteExtMap := range pc.remoteExtMaps {
+			// update existing locally provided value
+			for _, extMap := range pc.extMaps {
+				if extMap.URI.String() == remoteExtMap.URI.String() {
+					extMap.Value = remoteExtMap.Value
+					break
+				}
+			}
+		}
+	}
+
+	return nil
 }

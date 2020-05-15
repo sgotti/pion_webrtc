@@ -13,7 +13,14 @@ import (
 	"github.com/pion/sdp/v2"
 )
 
+const (
+	// TODO(sgotti) add these to pion/sdp
+	ExtMapValueSDESMid         = 4
+	ExtMapValueSDESRTPStreamID = 5
+)
+
 var (
+	// TODO(sgotti) add these to pion/sdp
 	transportCCURI, _              = url.Parse("http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01")
 	sdesMidURI, _                  = url.Parse("urn:ietf:params:rtp-hdrext:sdes:mid")
 	sdesRTPStreamIDURI, _          = url.Parse("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id")
@@ -314,9 +321,6 @@ func addTransceiverSDP(d *sdp.SessionDescription, isPlanB bool, mediaEngine *Med
 
 		for _, feedback := range codec.RTPCodecCapability.RTCPFeedback {
 			media.WithValueAttribute("rtcp-fb", fmt.Sprintf("%d %s %s", codec.PayloadType, feedback.Type, feedback.Parameter))
-			if feedback.Type == TypeRTCPFBTransportCC {
-				media.WithTransportCCExtMap()
-			}
 		}
 	}
 	if len(codecs) == 0 {

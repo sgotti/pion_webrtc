@@ -877,6 +877,8 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 				t = pc.newRTPTransceiver(receiver, nil, RTPTransceiverDirectionRecvonly, kind)
 			}
 
+			// mark the receiver as useRid here and not when calling Receiver.Receive in startRTP since it's executed
+			// asynchronously and could start after the remote has received our answer and started sending rtp/rtcp packets
 			if hasRids {
 				t.Receiver().useRid = true
 			}
@@ -1121,9 +1123,12 @@ func (pc *PeerConnection) startSCTP() {
 	pc.sctpTransport.lock.Unlock()
 }
 
-// drainSRTP pulls and discards RTP/RTCP packets that don't match any a:ssrc lines
-// If the remote SDP was only one media section the ssrc doesn't have to be explicitly declared
-func (pc *PeerConnection) drainSRTP() {
+// handleUnknownSRTP handles new rtp/rtcp streams not yet accepted by a receiver.
+// If the rtp streams provides mid/streamID header extension try to
+// associate it with a rid based receiver.
+// If we there's no rid based receiver try to use it for remote descriptions
+// with a single media section and no ssrc attributes or just ignore it.
+func (pc *PeerConnection) handleUnknownSRTP() {
 	handleUndeclaredSSRC := func(ssrc uint32) bool {
 		if remoteDescription := pc.RemoteDescription(); remoteDescription != nil {
 			if len(remoteDescription.parsed.MediaDescriptions) == 1 {
@@ -1963,7 +1968,7 @@ func (pc *PeerConnection) startRTP(isRenegotiation bool, remoteDesc *SessionDesc
 	pc.startRTPSenders(currentTransceivers)
 
 	if !isRenegotiation {
-		pc.drainSRTP()
+		pc.handleUnknownSRTP()
 		pc.startSCTP()
 	}
 }

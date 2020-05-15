@@ -202,7 +202,7 @@ func (t *Track) read(b []byte, streamId string) (n int, err error) {
 	r := t.receiver
 	t.mu.RUnlock()
 
-	return r.readRTP(b)
+	return r.readRTPStreamId(b, streamId)
 }
 
 // Read reads data from the track. If this is a local track this will

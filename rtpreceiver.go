@@ -21,8 +21,19 @@ type RTPReceiver struct {
 	closed, received chan interface{}
 	mu               sync.RWMutex
 
-	rtpReadStream  *srtp.ReadStreamSRTP
-	rtcpReadStream *srtp.ReadStreamSRTCP
+	useRid      bool
+	multiStream bool
+
+	// streamsIndex contains the stream index by streamId (stream ssrc or rid)
+	streamsIndex map[string]int
+
+	// since the number of streams is fixed and known we use a precreated slice with the known size
+	// and we access the stream by their id using the above ridsIndex
+	// using a map will require locking the map for every call to Read
+	rtpReadStreams       []*srtp.ReadStreamSRTP
+	rtcpReadStreams      []*srtp.ReadStreamSRTCP
+	rtpReadStreamsReady  []chan struct{}
+	rtcpReadStreamsReady []chan struct{}
 
 	// A reference to the associated api object
 	api *API
@@ -35,12 +46,26 @@ func (api *API) NewRTPReceiver(kind RTPCodecType, transport *DTLSTransport) (*RT
 	}
 
 	return &RTPReceiver{
-		kind:      kind,
-		transport: transport,
-		api:       api,
-		closed:    make(chan interface{}),
-		received:  make(chan interface{}),
+		kind:         kind,
+		transport:    transport,
+		api:          api,
+		streamsIndex: make(map[string]int),
+		closed:       make(chan interface{}),
+		received:     make(chan interface{}),
 	}, nil
+}
+
+func (r *RTPReceiver) readyStreams() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	c := 0
+	for _, s := range r.rtpReadStreams {
+		if s != nil {
+			c++
+		}
+	}
+	return c
 }
 
 // Transport returns the currently-configured *DTLSTransport or nil
@@ -80,8 +105,20 @@ func (r *RTPReceiver) Receive(parameters RTPReceiveParameters) error {
 		multiStream: len(parameters.Encodings) > 1,
 	}
 
+	r.rtpReadStreams = make([]*srtp.ReadStreamSRTP, len(parameters.Encodings))
+	r.rtcpReadStreams = make([]*srtp.ReadStreamSRTCP, len(parameters.Encodings))
+	r.rtpReadStreamsReady = make([]chan struct{}, len(parameters.Encodings))
+	r.rtcpReadStreamsReady = make([]chan struct{}, len(parameters.Encodings))
+
 	for i, enc := range parameters.Encodings {
+		// use the ssrc (since it's fixed) as the stream index
 		streamId := strconv.FormatUint(uint64(enc.SSRC), 10)
+		if r.useRid {
+			if enc.RID == "" {
+				return fmt.Errorf("receiver is rid based but encoding doesn't have a rid")
+			}
+			streamId = enc.RID
+		}
 
 		r.track.streams[i] = &TrackRTPStream{
 			id:    streamId,
@@ -90,47 +127,116 @@ func (r *RTPReceiver) Receive(parameters RTPReceiveParameters) error {
 			track: r.track,
 		}
 
-		r.track.streams[0].ssrc = enc.SSRC
-
-		// only one ssrc is supported
-		break
+		r.streamsIndex[streamId] = i
+		r.rtpReadStreamsReady[i] = make(chan struct{})
+		r.rtcpReadStreamsReady[i] = make(chan struct{})
 	}
 
-	srtpSession, err := r.transport.getSRTPSession()
-	if err != nil {
-		return err
-	}
+	// whe not using rids we already know the stream ssrc so we can setup it here
+	if !r.useRid {
+		srtpSession, err := r.transport.getSRTPSession()
+		if err != nil {
+			return err
+		}
 
-	r.rtpReadStream, err = srtpSession.OpenReadStream(parameters.Encodings[0].SSRC)
-	if err != nil {
-		return err
-	}
+		r.rtpReadStreams[0], err = srtpSession.OpenReadStream(parameters.Encodings[0].SSRC)
+		if err != nil {
+			return err
+		}
 
-	srtcpSession, err := r.transport.getSRTCPSession()
-	if err != nil {
-		return err
-	}
+		srtcpSession, err := r.transport.getSRTCPSession()
+		if err != nil {
+			return err
+		}
 
-	r.rtcpReadStream, err = srtcpSession.OpenReadStream(parameters.Encodings[0].SSRC)
-	if err != nil {
-		return err
-	}
+		r.rtcpReadStreams[0], err = srtcpSession.OpenReadStream(parameters.Encodings[0].SSRC)
+		if err != nil {
+			return err
+		}
 
-	r.track.streams[0].ready = true
+		r.track.streams[0].ready = true
+
+		close(r.rtpReadStreamsReady[0])
+		close(r.rtcpReadStreamsReady[0])
+	}
 
 	return nil
 }
 
+// setRTPReadStream sets a rtpReadStream. The stream index is the rid if the receiver is rid based or the ssrc if not rid based
+func (r *RTPReceiver) setRTPReadStream(rs *srtp.ReadStreamSRTP, rid string, ssrc uint32, payloadType uint8, codec *RTPCodec) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	streamId := strconv.FormatUint(uint64(ssrc), 10)
+	if r.useRid {
+		streamId = rid
+	}
+
+	idx := r.streamsIndex[streamId]
+	if r.rtpReadStreams[idx] != nil {
+		return
+	}
+
+	r.rtpReadStreams[idx] = rs
+
+	// open a rtcp read stream for the same ssrc
+	srtcpSession, _ := r.transport.getSRTCPSession()
+	r.rtcpReadStreams[idx], _ = srtcpSession.OpenReadStream(ssrc)
+
+	close(r.rtpReadStreamsReady[idx])
+	close(r.rtcpReadStreamsReady[idx])
+
+	r.track.streams[idx].mu.Lock()
+	r.track.streams[idx].ready = true
+	r.track.streams[idx].ssrc = ssrc
+	r.track.streams[idx].payloadType = payloadType
+	r.track.streams[idx].codec = codec
+
+	// Set the same payload for all streams
+	// TODO(sgotti) handle different payloaf for streams in the same track? Currently no implementation have different payloads
+	for _, stream := range r.track.streams {
+		stream.payloadType = payloadType
+		stream.codec = codec
+	}
+	r.track.streams[idx].mu.Unlock()
+}
+
+// setRTCPReadStream sets a rtcpReadStream. The stream index is the rid if the receiver is rid based or the ssrc if not rid based
+func (r *RTPReceiver) setRTCPReadStream(rs *srtp.ReadStreamSRTCP, rid string, ssrc uint32) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	streamId := strconv.FormatUint(uint64(ssrc), 10)
+	if r.useRid {
+		streamId = rid
+	}
+
+	idx := r.streamsIndex[streamId]
+	if r.rtcpReadStreams[idx] != nil {
+		return
+	}
+
+	r.rtcpReadStreams[idx] = rs
+	close(r.rtcpReadStreamsReady[idx])
+}
+
 // Read reads incoming RTCP for this RTPReceiver
 func (r *RTPReceiver) Read(b []byte) (n int, err error) {
-	<-r.received
-	return r.rtcpReadStream.Read(b)
+	if r.multiStream {
+		return 0, fmt.Errorf("receiver is multistream")
+	}
+
+	<-r.rtcpReadStreamsReady[0]
+	return r.rtcpReadStreams[0].Read(b)
 }
 
 // ReadRTCP is a convenience method that wraps Read and unmarshals for you
 func (r *RTPReceiver) ReadRTCP() ([]rtcp.Packet, error) {
+	<-r.rtcpReadStreamsReady[0]
+
 	b := make([]byte, receiveMTU)
-	i, err := r.Read(b)
+	i, err := r.rtcpReadStreams[0].Read(b)
 	if err != nil {
 		return nil, err
 	}
@@ -158,27 +264,38 @@ func (r *RTPReceiver) Stop() error {
 	default:
 	}
 
-	select {
-	case <-r.received:
-		if r.rtcpReadStream != nil {
-			if err := r.rtcpReadStream.Close(); err != nil {
+	for _, s := range r.rtpReadStreams {
+		if s != nil {
+			if err := s.Close(); err != nil {
 				return err
 			}
 		}
-		if r.rtpReadStream != nil {
-			if err := r.rtpReadStream.Close(); err != nil {
+	}
+
+	for _, s := range r.rtcpReadStreams {
+		if s != nil {
+			if err := s.Close(); err != nil {
 				return err
 			}
 		}
-	default:
 	}
 
 	close(r.closed)
 	return nil
 }
 
-// readRTP should only be called by a track, this only exists so we can keep state in one place
-func (r *RTPReceiver) readRTP(b []byte) (n int, err error) {
-	<-r.received
-	return r.rtpReadStream.Read(b)
+func (r *RTPReceiver) readRTPStreamId(b []byte, streamId string) (n int, err error) {
+	// TODO(sgotti) implement replaceble read streams (when ssrc for a rid changes)
+	idx := r.streamsIndex[streamId]
+
+	<-r.rtpReadStreamsReady[idx]
+	return r.rtpReadStreams[idx].Read(b)
+}
+
+func (r *RTPReceiver) readRTCPStreamId(b []byte, streamId string) (n int, err error) {
+	// TODO(sgotti) implement replaceble read streams (when ssrc for a rid changes)
+	idx := r.streamsIndex[streamId]
+
+	<-r.rtpReadStreamsReady[idx]
+	return r.rtpReadStreams[idx].Read(b)
 }

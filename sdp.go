@@ -12,6 +12,12 @@ import (
 	"github.com/pion/sdp/v2"
 )
 
+const (
+	// TODO(sgotti) add these to pion/sdp
+
+	sdesMidURI = "urn:ietf:params:rtp-hdrext:sdes:mid"
+)
+
 type streamDetails struct {
 	rid  string
 	ssrc uint32
@@ -346,6 +352,7 @@ func addTransceiverSDP(d *sdp.SessionDescription, isPlanB bool, mediaEngine *Med
 type mediaSection struct {
 	id           string
 	transceivers []*RTPTransceiver
+	extMaps      map[int]*sdp.ExtMap
 	data         bool
 }
 

@@ -5,6 +5,8 @@ package webrtc
 import (
 	"fmt"
 	"sync/atomic"
+
+	"github.com/pion/sdp/v2"
 )
 
 // RTPTransceiver represents a combination of an RTPSender and an RTPReceiver that share a common mid.
@@ -14,6 +16,13 @@ type RTPTransceiver struct {
 	receiver        atomic.Value // *RTPReceiver
 	direction       atomic.Value // RTPTransceiverDirection
 	remoteDirection atomic.Value // RTPTransceiverDirection
+
+	negotiationData atomic.Value
+
+	// remoteExtMaps are the current known remote extmaps by media section
+	remoteExtMaps map[int]*sdp.ExtMap
+	// extMaps are the negotiated extmaps by media section
+	extMaps map[int]*sdp.ExtMap
 
 	stopped bool
 	kind    RTPCodecType
@@ -56,6 +65,17 @@ func (t *RTPTransceiver) Mid() string {
 		return v.(string)
 	}
 	return ""
+}
+
+func (t *RTPTransceiver) setNegotiationData(negotiationData *NegotiationData) {
+	t.negotiationData.Store(negotiationData)
+}
+
+func (t *RTPTransceiver) getNegotiationData() *NegotiationData {
+	if v := t.negotiationData.Load(); v != nil {
+		return v.(*NegotiationData)
+	}
+	return nil
 }
 
 // Kind returns RTPTransceiver's kind.

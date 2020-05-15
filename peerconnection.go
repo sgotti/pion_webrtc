@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	mathRand "math/rand"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +60,8 @@ type PeerConnection struct {
 	// should be defined (see JSEP 3.4.1).
 	greaterMid int
 
+	currentSDESMidExtValue int
+
 	rtpTransceivers []*RTPTransceiver
 
 	onSignalingStateChangeHandler     func(SignalingState)
@@ -66,6 +69,8 @@ type PeerConnection struct {
 	onConnectionStateChangeHandler    func(PeerConnectionState)
 	onTrackHandler                    func(*Track, *RTPReceiver)
 	onDataChannelHandler              func(*DataChannel)
+
+	onMediaNegotiationHandler func(t *RTPTransceiver, offering bool) *NegotiationData
 
 	iceGatherer   *ICEGatherer
 	iceTransport  *ICETransport
@@ -108,6 +113,7 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 		lastOffer:                    "",
 		lastAnswer:                   "",
 		greaterMid:                   -1,
+		currentSDESMidExtValue:       -1,
 		signalingState:               SignalingStateStable,
 		iceConnectionState:           ICEConnectionStateNew,
 		connectionState:              PeerConnectionStateNew,
@@ -283,6 +289,52 @@ func (pc *PeerConnection) onTrack(t *Track, r *RTPReceiver) {
 	}
 }
 
+// SupportedExtMap represent an extmap
+type SupportedExtMap struct {
+	Direction sdp.Direction
+	URI       *url.URL
+	ExtAttr   *string
+}
+
+// NegotiationData represent specific negotiation data provided by the caller
+type NegotiationData struct {
+	SupportedExtMaps []SupportedExtMap
+}
+
+// OnMediaNegotiation sets an event handler which is called when remote track
+// arrives from a remote peer.
+func (pc *PeerConnection) OnMediaNegotiation(f func(t *RTPTransceiver, offering bool) *NegotiationData) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.onMediaNegotiationHandler = f
+}
+
+func (pc *PeerConnection) onMediaNegotiation(t *RTPTransceiver, offering bool) (*NegotiationData, error) {
+	hdlr := pc.onMediaNegotiationHandler
+
+	if hdlr == nil {
+		return nil, nil
+	}
+
+	negotiationData := hdlr(t, offering)
+
+	if negotiationData == nil {
+		return nil, nil
+	}
+
+	// validate negotiation data
+
+	seenURIs := map[string]struct{}{}
+	for _, supportedExtMap := range negotiationData.SupportedExtMaps {
+		if _, ok := seenURIs[supportedExtMap.URI.String()]; ok {
+			return nil, fmt.Errorf("duplicated extmap uri: %q", supportedExtMap.URI)
+		}
+		seenURIs[supportedExtMap.URI.String()] = struct{}{}
+	}
+
+	return negotiationData, nil
+}
+
 // OnICEConnectionStateChange sets an event handler which is called
 // when an ICE connection state is changed.
 func (pc *PeerConnection) OnICEConnectionStateChange(f func(ICEConnectionState)) {
@@ -440,6 +492,18 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 			pc.greaterMid++
 			err := t.setMid(strconv.Itoa(pc.greaterMid))
 			if err != nil {
+				return SessionDescription{}, err
+			}
+
+			if t.getNegotiationData() == nil {
+				negotiationData, err := pc.onMediaNegotiation(t, true)
+				if err != nil {
+					return SessionDescription{}, err
+				}
+				t.setNegotiationData(negotiationData)
+			}
+
+			if err := pc.handleOfferExtmaps(t); err != nil {
 				return SessionDescription{}, err
 			}
 		}
@@ -792,7 +856,7 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	localTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
 	detectedPlanB := descriptionIsPlanB(pc.RemoteDescription())
 
-	if !weOffer && !detectedPlanB {
+	if !detectedPlanB {
 		for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
 			midValue := getMidValue(media)
 			if midValue == "" {
@@ -833,6 +897,9 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 				t, localTransceivers = satisfyTypeAndDirection(kind, direction, localTransceivers)
 			}
 			if t == nil {
+				if weOffer {
+					continue
+				}
 				receiver, err := pc.api.NewRTPReceiver(kind, pc.dtlsTransport)
 				if err != nil {
 					return err
@@ -843,6 +910,19 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 				_ = t.setMid(midValue)
 			}
 			t.setRemoteDirection(direction)
+
+			if t.getNegotiationData() == nil {
+				negotiationData, err := pc.onMediaNegotiation(t, weOffer)
+				if err != nil {
+					return err
+				}
+
+				t.setNegotiationData(negotiationData)
+			}
+
+			if err := pc.handleAnswerExtMaps(t, media, weOffer); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1863,7 +1943,7 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 			if t.Sender() != nil {
 				t.Sender().setNegotiated()
 			}
-			mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}})
+			mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}, extMaps: t.extMaps})
 		}
 
 		mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), data: true})
@@ -1950,8 +2030,9 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 			if t.Sender() != nil {
 				t.Sender().setNegotiated()
 			}
+
 			mediaTransceivers := []*RTPTransceiver{t}
-			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: mediaTransceivers})
+			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: mediaTransceivers, extMaps: t.extMaps})
 		}
 	}
 
@@ -1961,7 +2042,7 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 			if t.Sender() != nil {
 				t.Sender().setNegotiated()
 			}
-			mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}})
+			mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}, extMaps: t.extMaps})
 		}
 	}
 
@@ -1970,4 +2051,221 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	}
 
 	return populateSDP(d, detectedPlanB, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState())
+}
+
+func (pc *PeerConnection) handleAnswerExtMaps(t *RTPTransceiver, media *sdp.MediaDescription, weOffer bool) error {
+	remoteExtMaps := map[int]*sdp.ExtMap{}
+
+	// populate known remote extmap and handle conflicts.
+	for _, attr := range media.Attributes {
+		if attr.Key != "extmap" {
+			continue
+		}
+		em := &sdp.ExtMap{}
+		if err := em.Unmarshal("extmap:" + attr.Value); err != nil {
+			pc.log.Warnf("Failed to parse ExtMap: %v", err)
+			continue
+		}
+		if remoteExtMap, ok := remoteExtMaps[em.Value]; ok {
+			if remoteExtMap.Value != em.Value {
+				return fmt.Errorf("RemoteDescription changed some extmaps values")
+			}
+		} else {
+			remoteExtMaps[em.Value] = em
+		}
+	}
+
+	// update our know remote extmaps from new extmaps from the current remote description
+	curRemoteExtMaps := t.remoteExtMaps
+	if curRemoteExtMaps == nil {
+		curRemoteExtMaps = make(map[int]*sdp.ExtMap)
+		t.remoteExtMaps = curRemoteExtMaps
+	}
+	for _, curRemoteExtMap := range remoteExtMaps {
+		if remoteExtMap, ok := curRemoteExtMaps[curRemoteExtMap.Value]; ok {
+			// check that the remote extmaps haven't changed some already known values
+			if remoteExtMap.Value != curRemoteExtMap.Value {
+				return fmt.Errorf("RemoteDescription changed some extmaps values")
+			}
+		} else {
+			// add new extmap
+			curRemoteExtMaps[curRemoteExtMap.Value] = curRemoteExtMap
+		}
+	}
+
+	// if we received an offer and extmap is not yet negotiated ask the user and populate the initial extmaps for this mid
+	pc.log.Infof("weOffer: %t", weOffer)
+	pc.log.Infof("t.extMaps: %+v", t.extMaps)
+	if !weOffer && t.extMaps == nil {
+		t.extMaps = make(map[int]*sdp.ExtMap)
+		supportedExtMaps := make(map[int]*sdp.ExtMap)
+
+		if t.getNegotiationData() != nil {
+			pc.log.Infof("supportedExtMaps: %+v", t.getNegotiationData().SupportedExtMaps)
+			curValue := 1
+			values := map[int]struct{}{}
+			if pc.currentSDESMidExtValue > 0 {
+				values[pc.currentSDESMidExtValue] = struct{}{}
+			}
+			for _, supportedExtMap := range t.getNegotiationData().SupportedExtMaps {
+				// use a generic value with the exception of the mid uri extmap that requires a global value
+				for {
+					if _, ok := values[curValue]; ok {
+						curValue++
+						continue
+					}
+					values[curValue] = struct{}{}
+					break
+				}
+				value := curValue
+				if supportedExtMap.URI.String() == sdesMidURI && pc.currentSDESMidExtValue > 0 {
+					value = pc.currentSDESMidExtValue
+				}
+				extMap := &sdp.ExtMap{
+					Value:     value,
+					URI:       supportedExtMap.URI,
+					Direction: supportedExtMap.Direction,
+					ExtAttr:   supportedExtMap.ExtAttr,
+				}
+				supportedExtMaps[value] = extMap
+			}
+		}
+		pc.log.Infof("supportedExtMaps: %+v", supportedExtMaps)
+		pc.log.Infof("t.extMaps: %+v", t.extMaps)
+
+		// On both offer and answer update our extMaps adapting to the remote values
+		for _, remoteExtMap := range t.remoteExtMaps {
+			// add extmap if supported
+			for _, extMap := range supportedExtMaps {
+				pc.log.Infof("extMap: %+v", extMap)
+				pc.log.Infof("remoteExtMap: %+v", remoteExtMap)
+				if extMap.URI.String() == remoteExtMap.URI.String() {
+					// use direction relative to remote extMap
+
+					// start with unknown direction
+					direction := extMap.Direction
+					switch remoteExtMap.Direction {
+					case sdp.DirectionRecvOnly:
+						switch extMap.Direction {
+						case sdp.DirectionRecvOnly:
+							// skip extmap since our supported direction is not acceptable by remote
+							continue
+						default:
+							direction = sdp.DirectionSendOnly
+						}
+					case sdp.DirectionSendOnly:
+						switch extMap.Direction {
+						case sdp.DirectionSendOnly:
+							// skip extmap since our supported direction is not acceptable by remote
+							continue
+						default:
+							direction = sdp.DirectionRecvOnly
+						}
+					}
+
+					t.extMaps[remoteExtMap.Value] = &sdp.ExtMap{
+						Value:     remoteExtMap.Value,
+						URI:       remoteExtMap.URI,
+						Direction: direction,
+						ExtAttr:   extMap.ExtAttr,
+					}
+					break
+				}
+
+				if remoteExtMap.URI.String() == sdesMidURI && pc.currentSDESMidExtValue < 0 {
+					pc.currentSDESMidExtValue = remoteExtMap.Value
+				}
+			}
+		}
+	}
+
+	// If we are receiving an answer remove not supported remote extmaps
+	if weOffer {
+		for _, extMap := range t.extMaps {
+			found := false
+			for _, remoteExtMap := range t.remoteExtMaps {
+				if extMap.URI.String() == remoteExtMap.URI.String() {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(t.extMaps, extMap.Value)
+			}
+		}
+	}
+
+	pc.log.Infof("t.remoteExtMaps: %+v", t.remoteExtMaps)
+	pc.log.Infof("t.extMaps: %+v", t.extMaps)
+
+	return nil
+}
+
+func (pc *PeerConnection) handleOfferExtmaps(t *RTPTransceiver) error {
+	if t.extMaps != nil {
+		return nil
+	}
+
+	curExtMaps := make(map[int]*sdp.ExtMap)
+	t.extMaps = curExtMaps
+
+	if t.getNegotiationData() == nil {
+		return nil
+	}
+
+	pc.log.Infof("supportedExtMaps: %+v", t.getNegotiationData().SupportedExtMaps)
+	curValue := 1
+	values := map[int]struct{}{}
+	if pc.currentSDESMidExtValue > 0 {
+		values[pc.currentSDESMidExtValue] = struct{}{}
+	}
+	for _, supportedExtMap := range t.getNegotiationData().SupportedExtMaps {
+		// use a generic value with the exception of the mid uri extmap that requires a global value
+		for {
+			if _, ok := values[curValue]; ok {
+				curValue++
+				continue
+			}
+			values[curValue] = struct{}{}
+			break
+		}
+		value := curValue
+		if supportedExtMap.URI.String() == sdesMidURI && pc.currentSDESMidExtValue >= 0 {
+			value = pc.currentSDESMidExtValue
+		}
+		extMap := &sdp.ExtMap{
+			Value:     value,
+			URI:       supportedExtMap.URI,
+			Direction: supportedExtMap.Direction,
+			ExtAttr:   supportedExtMap.ExtAttr,
+		}
+		curExtMaps[value] = extMap
+
+		if supportedExtMap.URI.String() == sdesMidURI && pc.currentSDESMidExtValue < 0 {
+			pc.currentSDESMidExtValue = value
+		}
+	}
+
+	return nil
+}
+
+// GetExtMapByURI return a copy of the extmap matching the provided
+// URI. Note that the extmap value will change if not yet negotiated
+func (pc *PeerConnection) GetExtMapByURI(mid, uri string) *sdp.ExtMap {
+	var t *RTPTransceiver
+	for _, t = range pc.GetTransceivers() {
+		if t.Mid() == mid {
+			break
+		}
+	}
+	if t == nil {
+		return nil
+	}
+
+	for _, extMap := range t.extMaps {
+		if extMap.URI.String() == uri {
+			return extMap
+		}
+	}
+	return nil
 }

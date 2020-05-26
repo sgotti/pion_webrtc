@@ -880,24 +880,31 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 
 			t, localTransceivers = findByMid(midValue, localTransceivers)
 			if t != nil {
-				transceiveDirection := t.Direction()
+				//transceiveDirection := t.Direction()
 
-				switch direction {
-				case RTPTransceiverDirectionRecvonly:
-					if transceiveDirection == RTPTransceiverDirectionRecvonly {
-						t.setDirection(RTPTransceiverDirectionInactive)
-					}
-					if transceiveDirection == RTPTransceiverDirectionSendrecv {
-						t.setDirection(RTPTransceiverDirectionSendonly)
-					}
-				case RTPTransceiverDirectionSendonly:
-					if transceiveDirection == RTPTransceiverDirectionSendonly {
-						t.setDirection(RTPTransceiverDirectionInactive)
-					}
-					if transceiveDirection == RTPTransceiverDirectionSendrecv {
-						t.setDirection(RTPTransceiverDirectionRecvonly)
-					}
-				}
+				//switch direction {
+				//case RTPTransceiverDirectionSendrecv:
+				//	if transceiveDirection == RTPTransceiverDirectionRecvonly {
+				//		t.setDirection(RTPTransceiverDirectionSendrecv)
+				//	}
+				//	if transceiveDirection == RTPTransceiverDirectionSendonly {
+				//		t.setDirection(RTPTransceiverDirectionSendrecv)
+				//	}
+				//case RTPTransceiverDirectionRecvonly:
+				//	if transceiveDirection == RTPTransceiverDirectionRecvonly {
+				//		t.setDirection(RTPTransceiverDirectionInactive)
+				//	}
+				//	if transceiveDirection == RTPTransceiverDirectionSendrecv {
+				//		t.setDirection(RTPTransceiverDirectionSendonly)
+				//	}
+				//case RTPTransceiverDirectionSendonly:
+				//	if transceiveDirection == RTPTransceiverDirectionSendonly {
+				//		t.setDirection(RTPTransceiverDirectionInactive)
+				//	}
+				//	if transceiveDirection == RTPTransceiverDirectionSendrecv {
+				//		t.setDirection(RTPTransceiverDirectionRecvonly)
+				//	}
+				//}
 			} else {
 				t, localTransceivers = satisfyTypeAndDirection(kind, direction, localTransceivers)
 			}
